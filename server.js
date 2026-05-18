@@ -1,254 +1,691 @@
-require('dotenv').config();
-
-const express = require('express');
-const cors = require('cors');
-
-const {
-  db,
-  createTransaction,
-  updateWallet,
-  getUser
-} = require('./firebase');
-
-const {
-  limiter,
-  authMiddleware,
-  adminMiddleware
-} = require('./middleware');
-
-const {
-  generateTransactionRef,
-  createFlutterwavePayment,
-  verifyFlutterwaveTransaction,
-  generateMysteryReward
-} = require('./services');
+const express = require("express");
+const cors = require("cors");
+const axios = require("axios");
+const admin = require("firebase-admin");
 
 const app = express();
 
 app.use(cors());
 app.use(express.json());
-app.use(limiter);
 
-app.get('/', (req, res) => {
+
+
+// ============================
+// FIREBASE ADMIN INIT
+// ============================
+
+const serviceAccount = JSON.parse(
+  process.env.FIREBASE_SERVICE_ACCOUNT
+);
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+});
+
+const db = admin.firestore();
+
+
+
+// ============================
+// ROOT ROUTE
+// ============================
+
+app.get("/", (req, res) => {
+
   res.json({
-    message: 'CONNECT Backend Running'
+    success: true,
+    message: "CONNECT Backend Running 🚀"
   });
+
 });
 
-// CREATE SUBSCRIPTION
-app.post('/create-subscription', authMiddleware, async (req, res) => {
+
+
+// ============================
+// TEST ROUTES
+// ============================
+
+app.get("/withdraw", (req, res) => {
+
+  res.json({
+    success: true,
+    message: "Withdraw API Working"
+  });
+
+});
+
+app.get("/deposit", (req, res) => {
+
+  res.json({
+    success: true,
+    message: "Deposit API Working"
+  });
+
+});
+
+
+
+// ============================
+// CREATE USER
+// ============================
+
+app.post("/create-user", async (req, res) => {
+
   try {
-    const { amount, redirect_url } = req.body;
 
-    const user = await getUser(req.user.uid);
+    const {
+      uid,
+      name,
+      email,
+      photo
+    } = req.body;
 
-    const tx_ref = generateTransactionRef();
+    await db.collection("users")
+    .doc(uid)
+    .set({
 
-    const payment = await createFlutterwavePayment({
-      amount,
-      email: user.email,
-      name: user.name || 'CONNECT User',
-      tx_ref,
-      redirect_url
+      uid,
+      name,
+      email,
+      photo,
+
+      role: "user",
+
+      wallet: 0,
+      loyaltyPoints: 0,
+      referrals: 0,
+
+      freeJobPosts: 2,
+
+      createdAt: new Date(),
+
+    }, { merge: true });
+
+    res.json({
+      success: true,
+      message: "User created"
     });
 
-    await createTransaction({
-      userId: req.user.uid,
-      type: 'subscription',
-      amount,
-      tx_ref,
-      status: 'pending'
+  } catch(err){
+
+    res.status(500).json({
+      success: false,
+      error: err.message
     });
 
-    return res.json(payment);
-  } catch (error) {
-    return res.status(500).json({
-      error: error.message
-    });
   }
+
 });
 
-// VERIFY PAYMENT
-app.post('/verify-payment', authMiddleware, async (req, res) => {
+
+
+// ============================
+// GET USER
+// ============================
+
+app.get("/user/:uid", async (req, res) => {
+
   try {
-    const { transactionId, plan } = req.body;
 
-    const verification = await verifyFlutterwaveTransaction(transactionId);
+    const uid = req.params.uid;
 
-    if (
-      verification.status === 'success' &&
-      verification.data.status === 'successful'
-    ) {
-      await db.collection('subscriptions').doc(req.user.uid).set({
-        plan,
-        active: true,
-        updatedAt: new Date()
+    const doc = await db
+    .collection("users")
+    .doc(uid)
+    .get();
+
+    if(!doc.exists){
+
+      return res.status(404).json({
+        success: false,
+        message: "User not found"
       });
+
+    }
+
+    res.json({
+      success: true,
+      user: doc.data()
+    });
+
+  } catch(err){
+
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
+
+  }
+
+});
+
+
+
+// ============================
+// DEPOSIT
+// ============================
+
+app.post("/deposit", async (req, res) => {
+
+  try {
+
+    const {
+      uid,
+      amount,
+      tx_ref
+    } = req.body;
+
+    if(!uid || !amount){
+
+      return res.status(400).json({
+        success: false,
+        message: "Missing fields"
+      });
+
+    }
+
+    await db.collection("transactions")
+    .add({
+
+      uid,
+      amount,
+      tx_ref,
+
+      type: "deposit",
+
+      status: "pending",
+
+      createdAt: new Date()
+
+    });
+
+    res.json({
+      success: true,
+      message: "Deposit initialized"
+    });
+
+  } catch(err){
+
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
+
+  }
+
+});
+
+
+
+// ============================
+// FLUTTERWAVE WEBHOOK
+// ============================
+
+app.post("/flutterwave-webhook", async (req, res) => {
+
+  try {
+
+    const secretHash = process.env.FLW_SECRET_HASH;
+
+    const signature =
+      req.headers["verif-hash"];
+
+    if(signature !== secretHash){
+
+      return res.status(401).send("Invalid hash");
+
+    }
+
+    const payload = req.body;
+
+    if(payload.status === "successful"){
+
+      const uid = payload.meta.uid;
+
+      const amount = Number(payload.amount);
+
+      const userRef =
+        db.collection("users").doc(uid);
+
+      await db.runTransaction(async (t) => {
+
+        const doc = await t.get(userRef);
+
+        const currentWallet =
+          doc.data().wallet || 0;
+
+        t.update(userRef, {
+          wallet: currentWallet + amount
+        });
+
+      });
+
+      await db.collection("transactions")
+      .add({
+
+        uid,
+        amount,
+
+        type: "deposit",
+
+        status: "successful",
+
+        createdAt: new Date()
+
+      });
+
+    }
+
+    res.sendStatus(200);
+
+  } catch(err){
+
+    console.log(err);
+
+    res.sendStatus(500);
+
+  }
+
+});
+
+
+
+// ============================
+// WITHDRAW
+// ============================
+
+app.post("/withdraw", async (req, res) => {
+
+  try {
+
+    const {
+      uid,
+      amount,
+      bankCode,
+      accountNumber,
+      accountName
+    } = req.body;
+
+    if(!uid || !amount){
+
+      return res.status(400).json({
+        success: false,
+        message: "Missing fields"
+      });
+
+    }
+
+    const userRef =
+      db.collection("users").doc(uid);
+
+    const userDoc = await userRef.get();
+
+    if(!userDoc.exists){
+
+      return res.status(404).json({
+        success: false,
+        message: "User not found"
+      });
+
+    }
+
+    const user = userDoc.data();
+
+    if(user.wallet < amount){
+
+      return res.status(400).json({
+        success: false,
+        message: "Insufficient balance"
+      });
+
+    }
+
+
+
+    // ============================
+    // FLUTTERWAVE TRANSFER
+    // ============================
+
+    const transfer = await axios.post(
+
+      "https://api.flutterwave.com/v3/transfers",
+
+      {
+
+        account_bank: bankCode,
+
+        account_number: accountNumber,
+
+        amount: amount,
+
+        narration: "CONNECT Withdrawal",
+
+        currency: "NGN",
+
+        reference:
+        "CONNECT-" + Date.now(),
+
+        callback_url:
+        "https://yourdomain.com/callback",
+
+        debit_currency: "NGN"
+
+      },
+
+      {
+
+        headers: {
+
+          Authorization:
+          `Bearer ${process.env.FLW_SECRET_KEY}`,
+
+          "Content-Type":
+          "application/json"
+
+        }
+
+      }
+
+    );
+
+
+
+    // ============================
+    // UPDATE WALLET
+    // ============================
+
+    await userRef.update({
+
+      wallet:
+      user.wallet - Number(amount)
+
+    });
+
+
+
+    // ============================
+    // SAVE TRANSACTION
+    // ============================
+
+    await db.collection("transactions")
+    .add({
+
+      uid,
+
+      amount,
+
+      bankCode,
+      accountNumber,
+      accountName,
+
+      type: "withdraw",
+
+      status: "successful",
+
+      flutterwaveResponse:
+      transfer.data,
+
+      createdAt: new Date()
+
+    });
+
+
+
+    res.json({
+
+      success: true,
+
+      message:
+      "Withdrawal successful",
+
+      data: transfer.data
+
+    });
+
+  } catch(err){
+
+    console.log(err.response?.data || err.message);
+
+    res.status(500).json({
+
+      success: false,
+
+      error:
+      err.response?.data || err.message
+
+    });
+
+  }
+
+});
+
+
+
+// ============================
+// CREATE PRODUCT
+// ============================
+
+app.post("/create-product", async (req, res) => {
+
+  try {
+
+    const product = req.body;
+
+    product.createdAt = new Date();
+
+    await db.collection("products")
+    .add(product);
+
+    res.json({
+      success: true,
+      message: "Product created"
+    });
+
+  } catch(err){
+
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
+
+  }
+
+});
+
+
+
+// ============================
+// GET PRODUCTS
+// ============================
+
+app.get("/products", async (req, res) => {
+
+  try {
+
+    const snapshot =
+      await db.collection("products").get();
+
+    const products = [];
+
+    snapshot.forEach(doc => {
+
+      products.push({
+        id: doc.id,
+        ...doc.data()
+      });
+
+    });
+
+    res.json({
+      success: true,
+      products
+    });
+
+  } catch(err){
+
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
+
+  }
+
+});
+
+
+
+// ============================
+// CREATE JOB
+// ============================
+
+app.post("/create-job", async (req, res) => {
+
+  try {
+
+    const job = req.body;
+
+    job.createdAt = new Date();
+
+    await db.collection("jobs")
+    .add(job);
+
+    res.json({
+      success: true,
+      message: "Job created"
+    });
+
+  } catch(err){
+
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
+
+  }
+
+});
+
+
+
+// ============================
+// APPLY FOR JOB
+// ============================
+
+app.post("/apply-job", async (req, res) => {
+
+  try {
+
+    const application = req.body;
+
+    application.createdAt = new Date();
+
+    await db.collection("applications")
+    .add(application);
+
+    res.json({
+      success: true,
+      message: "Application submitted"
+    });
+
+  } catch(err){
+
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
+
+  }
+
+});
+
+
+
+// ============================
+// CREATE AD
+// ============================
+
+app.post("/create-ad", async (req, res) => {
+
+  try {
+
+    const ad = req.body;
+
+    ad.status = "pending";
+
+    ad.createdAt = new Date();
+
+    await db.collection("ads")
+    .add(ad);
+
+    res.json({
+      success: true,
+      message: "Ad submitted for approval"
+    });
+
+  } catch(err){
+
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
+
+  }
+
+});
+
+
+
+// ============================
+// ADMIN LOGIN CHECK
+// ============================
+
+app.post("/admin-check", async (req, res) => {
+
+  try {
+
+    const { email } = req.body;
+
+    if(
+      email ===
+      "ebubechichukwu8@gmail.com"
+    ){
 
       return res.json({
         success: true,
-        message: 'Subscription activated'
+        admin: true
       });
+
     }
 
-    return res.status(400).json({
-      error: 'Payment failed'
-    });
-  } catch (error) {
-    return res.status(500).json({
-      error: error.message
-    });
-  }
-});
-
-// CREATE JOB
-app.post('/post-job', authMiddleware, async (req, res) => {
-  try {
-    const data = req.body;
-
-    const user = await getUser(req.user.uid);
-
-    if (
-      user.plan === 'free_trial' &&
-      user.freeJobPostsRemaining <= 0
-    ) {
-      return res.status(403).json({
-        error: 'Free trial exhausted'
-      });
-    }
-
-    await db.collection('jobs').add({
-      ...data,
-      ownerId: req.user.uid,
-      createdAt: new Date()
-    });
-
-    if (user.plan === 'free_trial') {
-      await db.collection('users').doc(req.user.uid).update({
-        freeJobPostsRemaining:
-          user.freeJobPostsRemaining - 1
-      });
-    }
-
-    return res.json({
+    res.json({
       success: true,
-      message: 'Job posted successfully'
+      admin: false
     });
-  } catch (error) {
-    return res.status(500).json({
-      error: error.message
+
+  } catch(err){
+
+    res.status(500).json({
+      success: false,
+      error: err.message
     });
+
   }
+
 });
 
-// APPLY FOR JOB
-app.post('/apply-job', authMiddleware, async (req, res) => {
-  try {
-    const {
-      jobId,
-      message,
-      cvUrl
-    } = req.body;
 
-    await db.collection('jobApplications').add({
-      jobId,
-      applicantId: req.user.uid,
-      message,
-      cvUrl,
-      status: 'pending',
-      createdAt: new Date()
-    });
 
-    return res.json({
-      success: true,
-      message: 'Application submitted'
-    });
-  } catch (error) {
-    return res.status(500).json({
-      error: error.message
-    });
-  }
-});
+// ============================
+// START SERVER
+// ============================
 
-// CLAIM MYSTERY BOX
-app.post('/claim-mystery-box', authMiddleware, async (req, res) => {
-  try {
-    const referralDoc = await db
-      .collection('referrals')
-      .doc(req.user.uid)
-      .get();
+const PORT =
+process.env.PORT || 3000;
 
-    const referralData = referralDoc.data();
+app.listen(PORT, () => {
 
-    if (
-      !referralData ||
-      referralData.successfulReferrals < 30
-    ) {
-      return res.status(400).json({
-        error: 'Not eligible'
-      });
-    }
+  console.log(
+    `CONNECT Backend Running On Port ${PORT}`
+  );
 
-    if (referralData.mysteryBoxClaimed) {
-      return res.status(400).json({
-        error: 'Already claimed'
-      });
-    }
-
-    const reward = generateMysteryReward();
-
-    await updateWallet(req.user.uid, reward);
-
-    await db.collection('mysteryRewards').add({
-      userId: req.user.uid,
-      reward,
-      createdAt: new Date()
-    });
-
-    await db.collection('referrals').doc(req.user.uid).update({
-      mysteryBoxClaimed: true
-    });
-
-    return res.json({
-      success: true,
-      reward
-    });
-  } catch (error) {
-    return res.status(500).json({
-      error: error.message
-    });
-  }
-});
-
-// ADMIN DELETE USER
-app.delete('/admin/delete-user/:uid', authMiddleware, adminMiddleware, async (req, res) => {
-  try {
-    await db.collection('users').doc(req.params.uid).delete();
-
-    return res.json({
-      success: true,
-      message: 'User deleted'
-    });
-  } catch (error) {
-    return res.status(500).json({
-      error: error.message
-    });
-  }
-});
-
-// FLUTTERWAVE WEBHOOK
-app.post('/flutterwave-webhook', async (req, res) => {
-  try {
-    const payload = req.body;
-
-    console.log('Webhook:', payload);
-
-    return res.sendStatus(200);
-  } catch (error) {
-    return res.sendStatus(500);
-  }
-});
-
-app.listen(process.env.PORT || 3000, () => {
-  console.log('CONNECT Backend Running');
 });
